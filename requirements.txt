@@ -1,0 +1,4 @@
+# CUDA build of PyTorch (RTX 4070, driver supports CUDA 12.8+):
+#   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu128
+torch
+numpy
