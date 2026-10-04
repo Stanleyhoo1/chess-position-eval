@@ -104,6 +104,111 @@ class ChessEvaluationModel(nn.Module):
         return out
 
 
+
+class ResidualBlock(nn.Module):
+    """Two 3x3 convolutions with batch norm and a skip connection; keeps 8x8."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + x)                # (batch, channels, 8, 8)
+
+
+class ChessEvaluationResNet(nn.Module):
+    """Larger evaluator: a residual convolutional trunk over the board.
+
+    Differences from ChessEvaluationModel:
+      * side to move, castling rights and the en-passant square are fed in as
+        extra 8x8 planes next to the piece embedding, so the convolutions can
+        see whose move it is instead of only the dense head seeing it;
+      * a stack of residual blocks (default 6 x 128 channels, 13 convolutions
+        deep) gives every square a view of the whole board before flattening;
+      * a 1x1 convolution squeezes channels before the dense head so the
+        memorization-prone fully connected layer stays small.
+
+    Inputs and output have exactly the same shapes and meanings as
+    ChessEvaluationModel, so train.py and load_model.py work unchanged.
+    """
+
+    NUM_PIECE_IDS = 13
+    META_PLANES = 1 + 4 + 1          # side to move, 4 castling flags, en-passant square
+
+    def __init__(self, blocks=6, channels=128, embed_dim=32, head_channels=32, head_hidden=256):
+        super().__init__()
+        self.cfg = dict(blocks=blocks, channels=channels, embed_dim=embed_dim,
+                        head_channels=head_channels, head_hidden=head_hidden)
+
+        self.piece_embedding = nn.Embedding(self.NUM_PIECE_IDS, embed_dim)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(embed_dim + self.META_PLANES, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+        )
+        self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(blocks)])
+
+        self.head_conv = nn.Sequential(
+            nn.Conv2d(channels, head_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(head_channels),
+            nn.ReLU(),
+        )
+        self.head_fc1 = nn.Linear(head_channels * 8 * 8, head_hidden)
+        self.head_out = nn.Linear(head_hidden, 1)
+        self.relu = nn.ReLU()
+
+    def config(self):
+        return dict(self.cfg)
+
+    @staticmethod
+    def _en_passant_plane(en_passant):
+        """(batch,) en-passant IDs -> (batch, 1, 8, 8) plane with a 1 on the target square.
+        IDs 1-8 are a3..h3 (board row 5, since row 0 is rank 8); 9-16 are a6..h6 (row 2)."""
+        batch = en_passant.shape[0]
+        plane = torch.zeros(batch, 64, device=en_passant.device)
+        has_ep = en_passant > 0
+        file_idx = (en_passant - 1) % 8
+        row = torch.where(en_passant >= 9, 2, 5)
+        square = row * 8 + file_idx
+        plane[has_ep, square[has_ep]] = 1.0
+        return plane.view(batch, 1, 8, 8)
+
+    def forward(self, board, side_to_move, castling_rights, en_passant):
+        board = board.long()
+        en_passant = en_passant.long()
+        side_to_move = side_to_move.float()
+        castling_rights = castling_rights.float()
+        batch = board.shape[0]
+
+        x = self.piece_embedding(board)                      # (batch, 8, 8, embed_dim)
+        x = x.permute(0, 3, 1, 2)                            # (batch, embed_dim, 8, 8)
+
+        meta = torch.cat([side_to_move, castling_rights], dim=1)           # (batch, 5)
+        meta_planes = meta.view(batch, 5, 1, 1).expand(batch, 5, 8, 8)     # (batch, 5, 8, 8)
+        ep_plane = self._en_passant_plane(en_passant)                      # (batch, 1, 8, 8)
+        x = torch.cat([x, meta_planes, ep_plane], dim=1)     # (batch, embed_dim + 6, 8, 8)
+
+        x = self.stem(x)                                     # (batch, channels, 8, 8)
+        x = self.blocks(x)                                   # (batch, channels, 8, 8)
+        x = self.head_conv(x)                                # (batch, head_channels, 8, 8)
+        x = x.flatten(start_dim=1)                           # (batch, head_channels * 64)
+        x = self.relu(self.head_fc1(x))                      # (batch, head_hidden)
+        return self.head_out(x)                              # (batch, 1), no final activation
+
+
+MODEL_CLASSES = {
+    "ChessEvaluationModel": ChessEvaluationModel,
+    "ChessEvaluationResNet": ChessEvaluationResNet,
+}
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     batch_size = 4
@@ -127,3 +232,15 @@ if __name__ == "__main__":
 
     assert output.shape == (batch_size, 1), f"expected (4, 1), got {tuple(output.shape)}"
     print("OK: output shape is (4, 1)")
+    # Same dummy batch through the larger residual model.
+    big = ChessEvaluationResNet().to(device)
+    big_out = big(board, side_to_move, castling_rights, en_passant)
+    n_small = sum(p.numel() for p in model.parameters())
+    n_big = sum(p.numel() for p in big.parameters())
+    print(f"ChessEvaluationModel params:  {n_small:,}")
+    print(f"ChessEvaluationResNet params: {n_big:,}  output shape {tuple(big_out.shape)}")
+    assert big_out.shape == (batch_size, 1)
+    # en-passant plane: id 5 = e3 -> row 5, file 4; id 12 = d6 -> row 2, file 3
+    plane = ChessEvaluationResNet._en_passant_plane(torch.tensor([0, 5, 12], device=device))
+    assert plane[0].sum() == 0 and plane[1, 0, 5, 4] == 1 and plane[2, 0, 2, 3] == 1 and plane.sum() == 2
+    print("OK: ResNet forward pass and en-passant plane")
