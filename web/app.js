@@ -426,45 +426,35 @@
   // taken immediately; stalemate counts as 0.
   async function botMove() {
     if (!state.locked || state.result || state.botThinking || state.legal.length === 0) return;
-    const pos = position();
-    const mover = state.turn;
     const fenBefore = F.toFen(state);
-    const candidates = state.legal.map((m) => {
-      const next = F.makeMove(pos, m);
-      let fixed = null;                               // decided without the model
-      if (F.legalMoves(next).length === 0) fixed = F.isInCheck(next) ? (mover === 'w' ? 2500 : -2500) : 0;
-      return { move: m, fen: F.toFen(next), fixed };
-    });
     state.botThinking = true;
     syncHistoryButtons();
     setMsg('Bot is thinking\u2026');
     try {
-      const need = candidates.filter((c) => c.fixed === null);
-      let scores = new Map();
-      if (need.length) {
-        const res = await fetch('/api/evaluate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fens: need.map((c) => c.fen) }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || ('Server returned ' + res.status));
-        need.forEach((c, i) => scores.set(c, data.results[i].cp));
-      }
+      // The server runs a full-width search (every legal move for both sides,
+      // captures resolved at the leaves) and returns the move it likes best.
+      // Earlier positions of the game, so the server can avoid (or seek) repetitions.
+      const history = state.history.slice(-200).map((snap) => F.toFen(snap));
+      const res = await fetch('/api/bestmove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fen: fenBefore, history }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || ('Server returned ' + res.status));
       // The position may have changed while we waited (undo, new analysis).
       if (!state.locked || F.toFen(state) !== fenBefore) return;
-      let best = null;
-      let bestScore = null;
-      for (const c of candidates) {
-        const cp = c.fixed !== null ? c.fixed : scores.get(c);
-        const score = mover === 'w' ? cp : -cp;         // higher is better for the mover
-        if (best === null || score > bestScore) { best = c; bestScore = score; }
-      }
-      const cp = best.fixed !== null ? best.fixed : scores.get(best);
-      const name = moveName(best.move);
+      const uci = String(data.move || '');
+      const from = F.sqIndex(uci.slice(0, 2));
+      const to = F.sqIndex(uci.slice(2, 4));
+      const promo = uci.length > 4 ? uci[4] : null;
+      const best = state.legal.find((m) => m.from === from && m.to === to && (m.promo || null) === promo);
+      if (!best) throw new Error('Server suggested an unknown move: ' + uci);
+      const name = data.san || moveName(best);
+      const detail = data.mate_in ? 'mate in ' + Math.abs(data.mate_in) : formatEval(data.cp);
       state.botThinking = false;
-      playMove(best.move);
-      state.note = 'Bot played ' + name + '. ';
+      playMove(best);
+      state.note = 'Bot played ' + name + ' (' + detail + ', depth ' + data.depth + '). ';
       if (state.result) setMsg(state.note + msgEl.textContent, 'ok');
       else setMsg(state.note + 'Analyzing\u2026');
     } catch (err) {

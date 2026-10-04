@@ -81,8 +81,9 @@
           <button id="newgame" class="load-btn" type="button">New game</button>
         </div>
         <p class="hint">
-          The bot plays whichever legal move the model scores best for its side.
-          Click or drag your pieces to move. Use Undo to take back a move.
+          The bot searches every legal move for both sides a few plies deep, resolving
+          captures at the end of each line with the model as the judge, and plays the
+          move that comes out best. Click or drag your pieces to move. Use Undo to take back a move.
         </p>
       </section>
 
