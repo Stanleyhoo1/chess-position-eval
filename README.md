@@ -24,6 +24,31 @@ python server.py            # http://localhost:8000
 
 Both need a trained checkpoint at `models/chess_eval.pt` (produced by `train.py`).
 
+## Playing on Lichess
+
+`lichess_bot.py` plays games on Lichess as a BOT account, using the same evaluator and
+search as the app. Lichess allows engine bots through its official Bot API, so this is
+the sanctioned way to put the model up against Stockfish or other bots.
+
+1. Create a fresh Lichess account for the bot (it must have no games played).
+2. Create an API token at <https://lichess.org/account/oauth/token/create> with the
+   scopes *Play games with the bot API* and *Create, accept, decline challenges*.
+3. `export LICHESS_TOKEN=lip_...`
+4. `python lichess_bot.py upgrade` (one time, irreversible: the account becomes a BOT).
+
+Then:
+
+```sh
+python lichess_bot.py play --ai 3                        # one game vs Lichess Stockfish level 3
+python lichess_bot.py play --ai 5 --color black --clock 5+3 --games 3
+python lichess_bot.py play --user maia1                  # challenge another bot
+python lichess_bot.py resume                             # play games already in progress, then exit
+python lichess_bot.py listen                             # play games as they start, accept challenges
+```
+
+`--depth` and `--seconds` set the search effort per move; the bot also scales its
+thinking time to the clock. Games can be watched live on the bot's Lichess profile.
+
 ## API
 
 `POST /api/evaluate` with `{"fen": "<fen>"}` returns
@@ -49,7 +74,8 @@ Both need a trained checkpoint at `models/chess_eval.pt` (produced by `train.py`
 - `web/` — static site (`index.html`, `style.css`, `app.js`, `fen.js`, `pieces/`)
 - `web/fen.js` — pure FEN parse/serialize logic, loadable under node for testing
 - `Dockerfile`, `nginx.conf`, `docker-compose.yml` — nginx container serving `web/` and proxying `/api/`
-- `server.py`, `Dockerfile.api` — model inference service (`load_model.py` + `model.py`)
+- `server.py`, `Dockerfile.api` — model inference service (`load_model.py` + `model.py` + `search.py`)
+- `lichess_bot.py` — plays on Lichess as a BOT account using the same search
 - `get_training_data.py`, `train.py` — build the `fen,evaluation` dataset and train the model
 
 Piece images are the "cburnett" set from Wikimedia Commons, licensed CC BY-SA 3.0.

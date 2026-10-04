@@ -6,3 +6,4 @@ huggingface_hub
 pyarrow
 pandas
 chess
+requests
