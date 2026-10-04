@@ -22,4 +22,6 @@ services:
       MODEL_PATH: models/chess_eval_10m_tanh_best.pt   # checkpoint to serve
       SEARCH_DEPTH: "6"                           # capture-search plies
       SEARCH_NODES: "4000"                        # node budget per request
+      BOT_DEPTH: "4"                              # full-search depth cap (plies) for the bot
+      BOT_SECONDS: "3"                            # time budget per bot move; deepest finished ply is used
     restart: unless-stopped

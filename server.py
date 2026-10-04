@@ -10,6 +10,13 @@ Endpoints:
                          search node budget is shared across the batch (at least
                          MIN_BATCH_NODES each), so scoring every legal move for the
                          in-app bot costs about as much as one single evaluation.
+    POST /api/bestmove   body {"fen": "<fen>", "depth": 4, "seconds": 3,
+                               "history": ["<fen>", ...]   (earlier positions of the game, optional)} ->
+                         {"move": "e2e4", "san": "e4", "cp": ..., "pawns": ...,
+                          "mate_in": 0, "line": "1. e4 e5 ...", "depth": <plies completed>,
+                          "nodes": n, "seconds": s}
+                         Full-width alpha-beta search over every legal move (both
+                         sides) with the capture search at the leaves; the bot uses it.
     GET  /api/health     -> {"ok": true, "model": "<path>", "device": "cpu", ...}
 
 Each evaluation runs the quiescence (capture) search from search.py with the
@@ -55,6 +62,8 @@ class Handler(SimpleHTTPRequestHandler):
     static = True
     search_depth = 6
     search_nodes = 4000
+    move_depth = 4
+    move_seconds = 3.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEB_DIR, **kwargs)
@@ -98,7 +107,10 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
-        if self.path.split("?", 1)[0] != "/api/evaluate":
+        path = self.path.split("?", 1)[0]
+        if path == "/api/bestmove":
+            return self.do_bestmove()
+        if path != "/api/evaluate":
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
         try:
             data = self.read_json()
@@ -120,6 +132,27 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, KeyError, IndexError) as e:
             return self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(e)})
         return self.send_json(HTTPStatus.OK, self.result_json(fen, result))
+
+    def do_bestmove(self):
+        try:
+            data = self.read_json()
+            if not isinstance(data, dict):
+                raise ValueError("body must be a JSON object")
+            fen = clean_fen(data.get("fen"))
+            depth = max(1, min(6, int(data.get("depth", self.move_depth))))
+            seconds = max(0.1, min(20.0, float(data.get("seconds", self.move_seconds))))
+            history = data.get("history") or []
+            if not isinstance(history, list) or len(history) > 1000 or not all(isinstance(h, str) for h in history):
+                raise ValueError('"history" must be a list of at most 1000 FEN strings')
+            result = best_move(self.model, fen, depth, seconds, self.search_depth, history)
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            return self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(e)})
+        return self.send_json(HTTPStatus.OK, {
+            "fen": fen, "move": result.move, "san": result.san,
+            "cp": round(result.score, 1), "pawns": round(result.score / 100, 2),
+            "mate_in": result.mate_in, "line": result.line, "depth": result.depth,
+            "nodes": result.nodes, "seconds": round(result.seconds, 3),
+        })
 
     @staticmethod
     def result_json(fen, result):
@@ -166,6 +199,21 @@ def validate_position(fen):
     return board
 
 
+def best_move(model, fen, depth=4, seconds=3.0, qdepth=6, history=()):
+    """FEN -> search.MoveResult from the full-width search. `history` holds
+    FENs of earlier positions in the game (treated as draws if repeated).
+    Raises ValueError for an invalid position."""
+    board = validate_position(fen)
+    seen = []
+    for h in history:
+        try:
+            seen.append(chess.Board(h))
+        except ValueError:
+            raise ValueError(f"invalid FEN in history: {h!r}") from None
+    with torch.inference_mode():
+        return Searcher(model, max_depth=qdepth).best_move(board, depth=depth, max_seconds=seconds, history=seen)
+
+
 def evaluate_position(model, fen, depth=6, max_nodes=4000):
     """FEN -> search.SearchResult (scores in centipawns from White's point of
     view, clipped to +-EVAL_SCALE). Raises ValueError for an invalid position."""
@@ -185,6 +233,10 @@ def main():
                         help="capture-search depth in plies")
     parser.add_argument("--max-nodes", type=int, default=int(os.environ.get("SEARCH_NODES", 4000)),
                         help="capture-search node budget per request")
+    parser.add_argument("--move-depth", type=int, default=int(os.environ.get("BOT_DEPTH", 4)),
+                        help="default full-search depth (plies) for /api/bestmove")
+    parser.add_argument("--move-seconds", type=float, default=float(os.environ.get("BOT_SECONDS", 3.0)),
+                        help="default time budget for /api/bestmove")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-static", action="store_true", help="only serve /api/, not web/")
@@ -201,6 +253,8 @@ def main():
     Handler.static = not args.no_static
     Handler.search_depth = args.depth
     Handler.search_nodes = args.max_nodes
+    Handler.move_depth = args.move_depth
+    Handler.move_seconds = args.move_seconds
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     what = "api + web/" if Handler.static else "api only"
