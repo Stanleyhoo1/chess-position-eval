@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Position Setup</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="board-area">
+      <div id="board" class="board" aria-label="Chess board"></div>
+    </section>
+
+    <aside class="panel">
+      <h1 class="panel-title">Setup Position</h1>
+
+      <div id="palette" class="palette"></div>
+
+      <div class="controls">
+        <select id="turn" class="turn" aria-label="Side to move">
+          <option value="w">White to move</option>
+          <option value="b">Black to move</option>
+        </select>
+        <button id="erase" class="icon-btn" type="button" title="Erase tool: click squares to remove pieces" aria-label="Erase tool">
+          <svg viewBox="0 0 24 24"><path d="M16.2 3.6 21 8.4a2 2 0 0 1 0 2.8l-8.6 8.6H7.2l-4.2-4.2a2 2 0 0 1 0-2.8l9.4-9.4a2 2 0 0 1 2.8 0zM9 18l7.9-7.9-4.4-4.4L5.4 12.8z" fill="currentColor"/><path d="M12 21h9" stroke="currentColor" stroke-width="2"/></svg>
+        </button>
+        <button id="flip" class="icon-btn" type="button" title="Flip board" aria-label="Flip board">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3v14M7 17l-3-3M7 17l3-3"/><path d="M17 21V7M17 7l-3 3M17 7l3 3"/></svg>
+        </button>
+        <button id="reset" class="icon-btn" type="button" title="Starting position" aria-label="Starting position">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+        </button>
+        <button id="clear" class="icon-btn" type="button" title="Clear board" aria-label="Clear board">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/><path d="M10 10v7M14 10v7"/></svg>
+        </button>
+      </div>
+
+      <div class="castling">
+        <div class="castling-col">
+          <div class="castling-head">White</div>
+          <label><input type="checkbox" id="cK"> <span>(O-O)</span></label>
+          <label><input type="checkbox" id="cQ"> <span>(O-O-O)</span></label>
+        </div>
+        <div class="castling-col">
+          <div class="castling-head">Black</div>
+          <label><input type="checkbox" id="ck"> <span>(O-O)</span></label>
+          <label><input type="checkbox" id="cq"> <span>(O-O-O)</span></label>
+        </div>
+      </div>
+
+      <div class="fen-row">
+        <input id="fen" class="fen" type="text" spellcheck="false" autocomplete="off" aria-label="FEN">
+        <button id="copy" class="copy-btn" type="button" title="Copy FEN">Copy</button>
+      </div>
+
+      <ul id="warnings" class="warnings"></ul>
+      <div id="msg" class="msg" aria-live="polite"></div>
+
+      <button id="load" class="load-btn" type="button">Load</button>
+
+      <p class="hint">
+        Click a piece in the palette, then click squares to place it. Drag pieces to move them.
+        Right-click a square or drag a piece off the board to remove it. Press Esc to deselect.
+      </p>
+    </aside>
+  </main>
+
+  <script src="fen.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
