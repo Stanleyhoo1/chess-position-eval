@@ -4,7 +4,22 @@ services:
     container_name: chess-position-setup
     ports:
       - "8080:80"
+    depends_on:
+      - api
     restart: unless-stopped
     # For live editing without rebuilding, uncomment:
     # volumes:
     #   - ./web:/usr/share/nginx/html:ro
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: chess-position-eval-api
+    volumes:
+      - ./models:/app/models:ro
+    environment:
+      MODEL_PATH: models/chess_eval_10m_tanh_best.pt   # checkpoint to serve
+      SEARCH_DEPTH: "6"                           # capture-search plies
+      SEARCH_NODES: "4000"                        # node budget per request
+    restart: unless-stopped

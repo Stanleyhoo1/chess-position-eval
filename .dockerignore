@@ -1,6 +1,8 @@
 .git
 .venv
 __pycache__
+*.pyc
+data/
+models/
 README.md
-model.py
 requirements.txt
