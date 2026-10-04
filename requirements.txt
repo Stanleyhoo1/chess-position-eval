@@ -5,3 +5,4 @@ numpy
 huggingface_hub
 pyarrow
 pandas
+chess
