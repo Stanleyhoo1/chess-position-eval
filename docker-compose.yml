@@ -1,0 +1,10 @@
+services:
+  web:
+    build: .
+    container_name: chess-position-setup
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+    # For live editing without rebuilding, uncomment:
+    # volumes:
+    #   - ./web:/usr/share/nginx/html:ro
