@@ -9,12 +9,21 @@
 <body>
   <main class="layout">
     <section class="board-area">
+      <div id="evalbar" class="evalbar empty" role="meter" aria-label="Position evaluation"
+           aria-valuemin="-25" aria-valuemax="25" title="Evaluation from White's point of view">
+        <div class="evalbar-fill"></div>
+        <span class="evalbar-label" id="evaltext"></span>
+      </div>
       <div id="board" class="board" aria-label="Chess board"></div>
     </section>
 
     <aside class="panel">
-      <h1 class="panel-title">Setup Position</h1>
+      <div class="tabs" role="tablist">
+        <button id="tab-analysis" class="tab active" type="button" role="tab" aria-selected="true">Analysis</button>
+        <button id="tab-bot" class="tab" type="button" role="tab" aria-selected="false">Play bot</button>
+      </div>
 
+      <section id="analysis-panel" class="mode-panel">
       <div id="palette" class="palette"></div>
 
       <div class="controls">
@@ -55,13 +64,40 @@
       </div>
 
       <ul id="warnings" class="warnings"></ul>
-      <div id="msg" class="msg" aria-live="polite"></div>
 
       <button id="load" class="load-btn" type="button">Load</button>
+      <button id="analyze" class="load-btn hidden" type="button">Analyze position</button>
+      <button id="newanalysis" class="analyze-btn hidden" type="button">New analysis</button>
+      </section>
 
-      <p class="hint">
+      <section id="bot-panel" class="mode-panel hidden">
+        <div class="bot-setup">
+          <label for="botcolor" class="bot-label">You play</label>
+          <select id="botcolor" class="turn" aria-label="Your colour">
+            <option value="w">White</option>
+            <option value="b">Black</option>
+            <option value="random">Random</option>
+          </select>
+          <button id="newgame" class="load-btn" type="button">New game</button>
+        </div>
+        <p class="hint">
+          The bot plays whichever legal move the model scores best for its side.
+          Click or drag your pieces to move. Use Undo to take back a move.
+        </p>
+      </section>
+
+      <div id="msg" class="msg" aria-live="polite"></div>
+
+      <div class="btn-row">
+        <button id="undo" class="analyze-btn hidden" type="button" disabled title="Undo (Left arrow)">Undo</button>
+        <button id="redo" class="analyze-btn hidden" type="button" disabled title="Redo (Right arrow)">Redo</button>
+      </div>
+
+      <p id="analysis-hint" class="hint">
         Click a piece in the palette, then click squares to place it. Drag pieces to move them.
         Right-click a square or drag a piece off the board to remove it. Press Esc to deselect.
+        Typing a FEN updates the board as you go; press Load to lock the position in for analysis.
+        Once loaded, play legal moves on the board and the evaluation updates after each one.
       </p>
     </aside>
   </main>
