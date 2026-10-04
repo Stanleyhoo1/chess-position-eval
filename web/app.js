@@ -18,8 +18,14 @@
   const redoBtn = $('redo');
   const botColorEl = $('botcolor');
   const newGameBtn = $('newgame');
-  const tabs = { analysis: $('tab-analysis'), bot: $('tab-bot') };
-  const panels = { analysis: $('analysis-panel'), bot: $('bot-panel') };
+  const tabs = { analysis: $('tab-analysis'), bot: $('tab-bot'), watch: $('tab-watch') };
+  const panels = { analysis: $('analysis-panel'), bot: $('bot-panel'), watch: $('watch-panel') };
+  const watchIdEl = $('watchid');
+  const watchBtn = $('watch');
+  const watchStopBtn = $('watchstop');
+  const watchInfoEl = $('watchinfo');
+  const watchNames = { w: $('watch-white'), b: $('watch-black') };
+  const watchClocks = { w: $('watch-wclock'), b: $('watch-bclock') };
   const analysisHint = $('analysis-hint');
   const panelEl = document.querySelector('.panel');
   const evalbarEl = $('evalbar');
@@ -44,7 +50,8 @@
     redo: [],        // snapshots undone and available for redo
     result: null,    // '1-0' | '0-1' | '1/2-1/2' once the locked game is over
     note: '',        // prefix for the next evaluation message, e.g. "Bot played e7-e5. "
-    mode: 'analysis', // 'analysis' (set up + analyze) or 'bot' (play a game against the bot)
+    mode: 'analysis', // 'analysis' (set up + analyze), 'bot' (play the bot) or 'watch' (follow a Lichess game)
+    watching: false, // a Lichess game stream is driving the board (no input allowed)
     bot: '',         // '' (off), 'w' or 'b': which side the bot plays (bot mode only)
     botThinking: false,
   };
@@ -259,6 +266,7 @@
 
   function setLocked(locked) {
     state.locked = locked;
+    state.watching = false;
     state.tool = null;
     state.selected = null;
     state.lastMove = null;
@@ -293,8 +301,17 @@
       panels[m].classList.toggle('hidden', m !== mode);
     }
     analysisHint.classList.toggle('hidden', mode !== 'analysis');
+    stopWatching();
     if (mode === 'bot') {
       startBotGame();
+    } else if (mode === 'watch') {
+      state.bot = '';
+      state.evalCp = null;
+      state.evalFen = null;
+      setLocked(true);
+      state.watching = true;
+      for (const el of [undoBtn, redoBtn]) el.classList.add('hidden');
+      setMsg('Paste a Lichess game link and press Watch.');
     } else {
       // Back to the editor, keeping whatever is on the board.
       state.bot = '';
@@ -469,6 +486,110 @@
     if (state.bot && state.bot === state.turn) botMove();
   }
 
+  // ---------- Watch a Lichess game ----------
+
+  let watchAbort = null;
+  let watchAnalyzeTimer = null;
+
+  function lichessGameId(text) {
+    const m = String(text || '').trim().match(/(?:lichess\.org\/)?([A-Za-z0-9]{8})(?:[A-Za-z0-9]{4})?(?:[\/?#]|$)/);
+    return m ? m[1] : null;
+  }
+
+  function stopWatching() {
+    if (watchAbort) { watchAbort.abort(); watchAbort = null; }
+    clearTimeout(watchAnalyzeTimer);
+    watchStopBtn.disabled = true;
+    watchBtn.disabled = false;
+  }
+
+  function fmtClock(seconds) {
+    if (seconds === undefined || seconds === null) return '';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return m + ':' + String(s).padStart(2, '0');
+  }
+
+  function applyWatchedPosition(obj) {
+    let parsed;
+    try {
+      parsed = F.parseFen(obj.fen);
+    } catch (err) {
+      return;
+    }
+    state.board = parsed.board;
+    state.turn = parsed.turn;
+    state.castling = parsed.castling;
+    state.ep = parsed.ep;
+    state.lastMove = obj.lm ? { from: F.sqIndex(obj.lm.slice(0, 2)), to: F.sqIndex(obj.lm.slice(2, 4)) } : null;
+    state.selected = null;
+    update();
+    for (const c of ['w', 'b']) {
+      watchClocks[c].textContent = fmtClock(c === 'w' ? obj.wc : obj.bc);
+      watchClocks[c].classList.toggle('active', state.turn === c);
+    }
+    // The stream replays the whole game first; only analyze once it goes quiet.
+    clearTimeout(watchAnalyzeTimer);
+    watchAnalyzeTimer = setTimeout(analyzePosition, 150);
+  }
+
+  async function watchGame() {
+    const id = lichessGameId(watchIdEl.value);
+    if (!id) { setMsg('That does not look like a Lichess game link or ID.', 'error'); return; }
+    stopWatching();
+    watchAbort = new AbortController();
+    watchBtn.disabled = true;
+    watchStopBtn.disabled = false;
+    watchInfoEl.classList.add('hidden');
+    setMsg('Connecting to lichess.org/' + id + '\u2026');
+    try {
+      const res = await fetch('https://lichess.org/api/stream/game/' + id, { signal: watchAbort.signal });
+      if (!res.ok) throw new Error(res.status === 404 ? 'game not found' : 'Lichess returned ' + res.status);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let moves = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const obj = JSON.parse(line);
+          if (obj.players) {
+            const isBot = (p) => !!(p.user && p.user.title === 'BOT');
+            const name = (p) => (isBot(p) ? 'BOT ' : '') + ((p.user && p.user.name) || (p.aiLevel ? 'Stockfish level ' + p.aiLevel : 'Anonymous'))
+              + (p.rating ? ' (' + p.rating + ')' : '');
+            watchNames.w.textContent = name(obj.players.white);
+            watchNames.b.textContent = name(obj.players.black);
+            watchInfoEl.classList.remove('hidden');
+            // Put a BOT player (yours, presumably) at the bottom of the board.
+            const botIsBlack = isBot(obj.players.black) && !isBot(obj.players.white);
+            if (state.flipped !== botIsBlack) { state.flipped = botIsBlack; buildBoard(); }
+            if (obj.initialFen) applyWatchedPosition({ fen: obj.initialFen });
+          } else if (obj.fen) {
+            moves += 1;
+            applyWatchedPosition(obj);
+          }
+        }
+      }
+      setMsg('Game over. ' + msgEl.textContent, 'ok');
+    } catch (err) {
+      if (err.name !== 'AbortError') setMsg('Watching failed: ' + err.message, 'error');
+    } finally {
+      if (watchAbort && !watchAbort.signal.aborted) { watchAbort = null; }
+      watchStopBtn.disabled = true;
+      watchBtn.disabled = false;
+    }
+  }
+
+  watchBtn.addEventListener('click', watchGame);
+  watchIdEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); watchGame(); } });
+  watchStopBtn.addEventListener('click', () => { stopWatching(); setMsg('Stopped watching.'); });
+  $('watchflip').addEventListener('click', () => { state.flipped = !state.flipped; buildBoard(); renderEval(); });
+
   // ---------- Pointer handling (click + drag) ----------
 
   let ptr = null;
@@ -577,7 +698,7 @@
     const sq = Number(sqEl.dataset.sq);
     const piece = state.board[sq];
     if (state.locked) {
-      if (state.result || state.botThinking) return;
+      if (state.result || state.botThinking || state.watching) return;
       if (piece && F.pieceColor(piece) === state.turn) {
         startPointer(e, piece, sq);                      // drag or click-select own piece
       } else if (e.button === 0) {
@@ -741,6 +862,7 @@
   redoBtn.addEventListener('click', redoMove);
   tabs.analysis.addEventListener('click', () => setMode('analysis'));
   tabs.bot.addEventListener('click', () => setMode('bot'));
+  tabs.watch.addEventListener('click', () => setMode('watch'));
   newGameBtn.addEventListener('click', startBotGame);
   fenEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); if (!state.locked) loadFen(); }
@@ -760,7 +882,7 @@
 
   document.addEventListener('keydown', (e) => {
     const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes((e.target.tagName || '').toUpperCase());
-    if (state.locked && !typing) {
+    if (state.locked && !typing && !state.watching) {
       if (e.key === 'ArrowLeft') { e.preventDefault(); undoMove(); return; }
       if (e.key === 'ArrowRight') { e.preventDefault(); redoMove(); return; }
     }

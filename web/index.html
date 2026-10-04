@@ -21,6 +21,7 @@
       <div class="tabs" role="tablist">
         <button id="tab-analysis" class="tab active" type="button" role="tab" aria-selected="true">Analysis</button>
         <button id="tab-bot" class="tab" type="button" role="tab" aria-selected="false">Play bot</button>
+        <button id="tab-watch" class="tab" type="button" role="tab" aria-selected="false">Watch</button>
       </div>
 
       <section id="analysis-panel" class="mode-panel">
@@ -84,6 +85,27 @@
           The bot searches every legal move for both sides a few plies deep, resolving
           captures at the end of each line with the model as the judge, and plays the
           move that comes out best. Click or drag your pieces to move. Use Undo to take back a move.
+        </p>
+      </section>
+
+      <section id="watch-panel" class="mode-panel hidden">
+        <div class="fen-row">
+          <input id="watchid" class="fen" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="Lichess game URL or ID" aria-label="Lichess game URL or ID">
+          <button id="watch" class="copy-btn" type="button">Watch</button>
+        </div>
+        <div id="watchinfo" class="watch-info hidden">
+          <div class="watch-player"><span id="watch-black" class="watch-name"></span><span id="watch-bclock" class="watch-clock"></span></div>
+          <div class="watch-player"><span id="watch-white" class="watch-name"></span><span id="watch-wclock" class="watch-clock"></span></div>
+        </div>
+        <div class="btn-row">
+          <button id="watchflip" class="analyze-btn" type="button">Flip board</button>
+          <button id="watchstop" class="analyze-btn" type="button" disabled>Stop</button>
+        </div>
+        <p class="hint">
+          Follows a Lichess game live and scores every position with the model, so the eval bar
+          shows the network's view while your bot plays. Paste the link printed by
+          <code>lichess_bot.py</code>, or any public Lichess game.
         </p>
       </section>
 

@@ -225,6 +225,20 @@ html, body {
   gap: 14px;
 }
 
+.watch-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--panel-raised);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.watch-player { display: flex; justify-content: space-between; font-size: 14px; }
+.watch-name { font-weight: 600; }
+.watch-clock { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--text-muted); }
+.watch-clock.active { color: var(--text); font-weight: 700; }
+.hint code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+
 .bot-setup {
   display: flex;
   align-items: center;
