@@ -1,81 +1,576 @@
 """Training setup for ChessEvaluationModel.
 
-Defines the loss (MSE) and optimizer (Adam, lr=0.001) and a minimal training
-loop. Real dataset loading / preprocessing is not implemented here; the loop
-works with any DataLoader whose batches are tuples of
+Defines the loss (Huber on a squashed target), the optimizer (Adam with a
+warmup + cosine learning-rate decay), a minimal training
+loop, and the FEN -> tensor encoding used to turn the training CSV (columns
+``fen,evaluation``, written by get_training_data.py) into model inputs:
 
-    (board, side_to_move, castling_rights, en_passant, target)
+    board            (8, 8) long tensor of piece IDs, row 0 = rank 8, col 0 = a-file.
+                     0 = empty, 1-6 = white P N B R Q K, 7-12 = black p n b r q k.
+                     Used directly as indices into the model's piece embedding.
+    side_to_move     (1,)   1 = White to move, 0 = Black to move
+    castling_rights  (4,)   [W kingside, W queenside, B kingside, B queenside]
+    en_passant       ()     0 = none, 1-8 = a3..h3, 9-16 = a6..h6
 
-with the input shapes documented in model.py and target of shape (batch, 1).
+The finished model is saved as a checkpoint (``--out``, default
+models/chess_eval.pt) that load_model.py can reload.
+
+How much training happens:
+    --epochs N     N full passes over the data (default 20). Each epoch does
+                   ceil(rows / batch_size) optimizer updates.
+    --updates N    stop after exactly N optimizer updates instead, regardless
+                   of where that falls in an epoch.
+
+Two architectures are available (see model.py): ``--model small`` is the
+original two-convolution network, ``--model large`` (default) is the deeper
+residual network. The checkpoint records which one was used.
+
+Usage:
+    python train.py                                   # all rows of data/training_data.csv, 20 epochs
+    python train.py --limit 100 --updates 100         # quick test: first 100 rows, 100 updates
+    python train.py --epochs 5 --batch-size 256 --out models/run1.pt
 """
 
+import argparse
+import math
+import os
+import time
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
-from model import ChessEvaluationModel
+from model import MODEL_CLASSES, ChessEvaluationModel, ChessEvaluationResNet
 
 
-def build_training_components(model):
-    criterion = nn.MSELoss()
+# ---------------------------------------------------------------------------
+# FEN encoding
+# ---------------------------------------------------------------------------
+
+PIECE_IDS = {
+    "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
+    "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
+}
+FILES = "abcdefgh"
+
+# Evaluations in the CSV are centipawns clipped to +-2500. The network never
+# predicts raw centipawns; it predicts a *target* in [-1, 1] and load_model.py
+# inverts the mapping so scores are reported in centipawns again.
+#
+#   "linear": target = cp / 2500. Equal weight per centipawn, so the loss is
+#             dominated by blowouts and mates.
+#   "tanh":   target = tanh(cp / 543), the curve Lichess uses to turn an
+#             evaluation into a win probability. It stretches the range that
+#             decides most games (|cp| <= 300 maps to |target| <= 0.5) and
+#             compresses everything beyond a few pawns, so the model is
+#             rewarded for telling +0.5 from +1.5 rather than +15 from +25.
+EVAL_SCALE = 2500.0
+TANH_SCALE = 543.0
+TARGET_TRANSFORMS = ("tanh", "linear")
+_TANH_MAX = math.tanh(EVAL_SCALE / TANH_SCALE)      # target of a +2500 position
+
+
+def cp_to_target(cp, transform="tanh"):
+    """Centipawn tensor -> training target tensor in [-1, 1]."""
+    if transform == "linear":
+        return cp / EVAL_SCALE
+    if transform == "tanh":
+        return torch.tanh(cp / TANH_SCALE)
+    raise ValueError(f"unknown target transform {transform!r}")
+
+
+def target_to_cp(target, transform="tanh"):
+    """Inverse of cp_to_target. Outputs are clipped to +-EVAL_SCALE."""
+    if transform == "linear":
+        return (target * EVAL_SCALE).clamp(-EVAL_SCALE, EVAL_SCALE)
+    if transform == "tanh":
+        return TANH_SCALE * torch.atanh(target.clamp(-_TANH_MAX, _TANH_MAX))
+    raise ValueError(f"unknown target transform {transform!r}")
+
+
+def _board_squares(board_field):
+    """FEN board field -> flat list of 64 piece IDs in FEN order (a8 .. h1)."""
+    ranks = board_field.split("/")
+    if len(ranks) != 8:
+        raise ValueError(f"bad board field: {board_field!r}")
+    squares = []
+    for rank in ranks:
+        n = len(squares)
+        for ch in rank:
+            if ch.isdigit():
+                squares.extend((0,) * int(ch))
+            else:
+                squares.append(PIECE_IDS[ch])
+        if len(squares) - n != 8:
+            raise ValueError(f"bad board field: {board_field!r}")
+    return squares
+
+
+def fen_to_board(fen):
+    """FEN (or just its board field) -> (8, 8) long tensor of piece IDs.
+
+    Row 0 is rank 8 and column 0 is the a-file, i.e. the board as printed from
+    White's side. The values are embedding indices, not magnitudes.
+    """
+    return torch.tensor(_board_squares(fen.split()[0]), dtype=torch.long).view(8, 8)
+
+
+def encode_en_passant(ep_field):
+    """'-' -> 0, a3..h3 -> 1..8, a6..h6 -> 9..16."""
+    if ep_field == "-":
+        return 0
+    file_idx = FILES.index(ep_field[0])
+    rank = ep_field[1]
+    if rank == "3":
+        return 1 + file_idx
+    if rank == "6":
+        return 9 + file_idx
+    raise ValueError(f"bad en passant square: {ep_field!r}")
+
+
+def _encode_fen_parts(fen):
+    """FEN -> (64 piece IDs, side_to_move, [4 castling flags], en_passant) as plain ints."""
+    parts = fen.split()
+    squares = _board_squares(parts[0])
+    side_to_move = 1 if parts[1] == "w" else 0
+    castling_field = parts[2] if len(parts) > 2 else "-"
+    castling = [int(c in castling_field) for c in "KQkq"]
+    en_passant = encode_en_passant(parts[3]) if len(parts) > 3 else 0
+    return squares, side_to_move, castling, en_passant
+
+
+def encode_fen(fen):
+    """FEN -> (board, side_to_move, castling_rights, en_passant) tensors with
+    the per-sample shapes documented at the top of this file."""
+    squares, side_to_move, castling, en_passant = _encode_fen_parts(fen)
+    return (
+        torch.tensor(squares, dtype=torch.long).view(8, 8),
+        torch.tensor([side_to_move], dtype=torch.long),
+        torch.tensor(castling, dtype=torch.long),
+        torch.tensor(en_passant, dtype=torch.long),
+    )
+
+
+# Vectorized encoding of many FENs at once. Each FEN board field is expanded
+# with str.translate so digits become runs of "0" and "/" disappears, giving
+# exactly 64 characters per position; a 256-entry lookup table then maps the
+# characters to piece IDs in one numpy operation.
+_EXPAND_TABLE = str.maketrans({**{str(n): "0" * n for n in range(1, 9)}, "/": ""})
+_PIECE_LUT = np.zeros(256, dtype=np.uint8)
+for _ch, _pid in PIECE_IDS.items():
+    _PIECE_LUT[ord(_ch)] = _pid
+_EP_IDS = {f"{f}3": 1 + i for i, f in enumerate(FILES)}
+_EP_IDS.update({f"{f}6": 9 + i for i, f in enumerate(FILES)})
+
+
+def encode_fens(fens):
+    """Encode a sequence of FEN strings into compact numpy arrays:
+    board (n, 8, 8) uint8, side_to_move (n, 1) uint8, castling (n, 4) uint8,
+    en_passant (n,) uint8. Same encoding as encode_fen, ~100x faster."""
+    parts = pd.Series(fens, dtype="string").str.split(" ", expand=True)
+    n = len(parts)
+
+    expanded = parts[0].str.translate(_EXPAND_TABLE)
+    if not (expanded.str.len() == 64).all():
+        bad = parts[0][expanded.str.len() != 64].iloc[0]
+        raise ValueError(f"bad board field: {bad!r}")
+    board = _PIECE_LUT[np.frombuffer("".join(expanded).encode("ascii"), dtype=np.uint8)]
+    board = board.reshape(n, 8, 8)
+
+    side = (parts[1] == "w").to_numpy(dtype=np.uint8).reshape(n, 1)
+
+    castling_field = parts[2].fillna("-") if parts.shape[1] > 2 else pd.Series(["-"] * n, dtype="string")
+    castling = np.stack([castling_field.str.contains(c, regex=False).to_numpy(dtype=np.uint8)
+                         for c in "KQkq"], axis=1)
+
+    ep_field = parts[3].fillna("-") if parts.shape[1] > 3 else pd.Series(["-"] * n, dtype="string")
+    en_passant = ep_field.map(_EP_IDS).fillna(0).to_numpy(dtype=np.uint8)
+
+    return board, side, castling, en_passant
+
+
+def load_dataset(csv_path, limit=None, use_cache=True, transform="tanh"):
+    """Read a ``fen,evaluation`` CSV into a TensorDataset of
+    (board, side_to_move, castling_rights, en_passant, target).
+
+    Boards and metadata are uint8 (about 70 bytes per position, so 10M rows
+    fit in ~0.7 GB); the model converts them to long/float itself. Targets
+    are float32 in [-1, 1] (see cp_to_target; `transform` picks the mapping).
+
+    The encoded tensors are cached next to the CSV (<csv>.encoded.pt, or
+    <csv>.first<limit>.encoded.pt when --limit is used) and
+    reused while the CSV is unchanged, so only the first run pays for encoding.
+    """
+    cache_path = csv_path + (".encoded.pt" if limit is None else f".first{limit}.encoded.pt")
+    stat = os.stat(csv_path)
+    # The cache stores raw centipawns so any transform can be applied on load.
+    cache_key = {"size": stat.st_size, "mtime": stat.st_mtime, "limit": limit, "target": "centipawns"}
+    if use_cache and os.path.exists(cache_path):
+        cached = torch.load(cache_path)
+        if cached.get("key") == cache_key:
+            *inputs, cp = cached["tensors"]
+            return TensorDataset(*inputs, cp_to_target(cp, transform))
+
+    started = time.time()
+    df = pd.read_csv(csv_path, usecols=["fen", "evaluation"], nrows=limit,
+                     dtype={"fen": "string", "evaluation": "float32"})
+    if len(df) == 0:
+        raise ValueError(f"no rows read from {csv_path}")
+    board, side, castling, en_passant = encode_fens(df["fen"])
+    cp = df["evaluation"].to_numpy(dtype=np.float32).reshape(-1, 1).copy()   # writable for torch
+
+    tensors = (
+        torch.from_numpy(board),          # (n, 8, 8) uint8
+        torch.from_numpy(side),           # (n, 1)    uint8
+        torch.from_numpy(castling),       # (n, 4)    uint8
+        torch.from_numpy(en_passant),     # (n,)      uint8
+        torch.from_numpy(cp),             # (n, 1)    float32 centipawns
+    )
+    print(f"encoded {len(df):,} positions in {time.time() - started:.1f}s")
+    if use_cache:
+        torch.save({"key": cache_key, "tensors": tensors}, cache_path)
+    *inputs, cp = tensors
+    return TensorDataset(*inputs, cp_to_target(cp, transform))
+
+
+class Batches:
+    """Shuffled mini-batches drawn by indexing tensors that live on the
+    training device. For small fixed-size samples this is far faster than a
+    DataLoader, which collates Python objects one sample at a time."""
+
+    def __init__(self, dataset, batch_size, device, shuffle=True):
+        self.tensors = [t.to(device) for t in dataset.tensors]
+        self.n = len(dataset)
+        self.batch_size = batch_size
+        self.device = device
+        self.shuffle = shuffle
+
+    def __len__(self):
+        return -(-self.n // self.batch_size)
+
+    def __iter__(self):
+        if self.shuffle:
+            order = torch.randperm(self.n, device=self.device)
+        else:
+            order = torch.arange(self.n, device=self.device)
+        for i in range(0, self.n, self.batch_size):
+            idx = order[i:i + self.batch_size]
+            yield tuple(t[idx] for t in self.tensors)
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+def build_training_components(model, lr=0.001, loss="huber", huber_delta=0.2):
+    """Loss and optimizer.
+
+    "mse":   squared error everywhere; a few huge misses dominate the gradient.
+    "huber": squared error for |error| <= delta, absolute error beyond it, so
+             outliers (mislabelled or mate positions) pull with bounded force.
+             delta is in target units; 0.2 is about a 110 cp miss on a
+             balanced position under the tanh transform.
+    """
+    if loss == "mse":
+        criterion = nn.MSELoss()
+    elif loss == "huber":
+        criterion = nn.HuberLoss(delta=huber_delta)
+    else:
+        raise ValueError(f"unknown loss {loss!r}")
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=0.001
+        lr=lr
     )
     return criterion, optimizer
 
 
-def train_step(model, criterion, optimizer, batch, device):
-    """One optimizer update on a single batch. Returns the batch loss as a float."""
+def make_lr_schedule(kind, total_updates, warmup=0):
+    """Return f(update_index) -> learning-rate multiplier in [0, 1].
+
+    "constant": always 1.
+    "cosine":   linear warmup from 0 over `warmup` updates, then cosine decay
+                from 1 to 0 over the remaining updates, so the final updates
+                take tiny steps that settle the weights instead of bouncing.
+    """
+    if kind == "constant":
+        return lambda t: 1.0
+    if kind == "cosine":
+        decay_len = max(1, total_updates - warmup)
+
+        def factor(t):
+            if warmup and t < warmup:
+                return (t + 1) / warmup
+            return 0.5 * (1.0 + math.cos(math.pi * min(1.0, (t - warmup) / decay_len)))
+        return factor
+    raise ValueError(f"unknown schedule {kind!r}")
+
+
+def train_step(model, criterion, optimizer, batch, device, amp=False, transform="tanh"):
+    """One optimizer update on a single batch.
+
+    Returns (loss, squared_cp_error_sum, batch_rows): the loss in target units
+    plus the ingredients for a true centipawn RMSE after inverting the target
+    transform. With amp=True the forward pass runs in bfloat16 autocast (the
+    loss and the weights stay float32), which is much faster on tensor-core GPUs.
+    """
     board, side_to_move, castling_rights, en_passant, target = (t.to(device) for t in batch)
 
     model.train()
     optimizer.zero_grad()
-    prediction = model(board, side_to_move, castling_rights, en_passant)   # (batch, 1)
-    loss = criterion(prediction, target.float())                            # scalar
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+        prediction = model(board, side_to_move, castling_rights, en_passant)   # (batch, 1)
+    prediction = prediction.float()
+    loss = criterion(prediction, target.float())                                # scalar
     loss.backward()
     optimizer.step()
-    return loss.item()
+    with torch.no_grad():
+        cp_err = target_to_cp(prediction.detach(), transform) - target_to_cp(target.float(), transform)
+        sq_cp = (cp_err ** 2).sum().item()
+    return loss.item(), sq_cp, target.shape[0]
 
 
-def train(model, dataloader, epochs, device, log_every=1):
-    """Train for `epochs` passes over `dataloader`. Returns a list of mean epoch losses."""
-    criterion, optimizer = build_training_components(model)
+@torch.no_grad()
+def evaluate(model, batches, amp=False, transform="tanh", criterion=None):
+    """Returns (mean loss in target units, RMSE in centipawns) over all batches.
+    `criterion` defaults to MSE; pass the training criterion to match it."""
+    model.eval()
+    device = next(model.parameters()).device
+    if criterion is None:
+        criterion = nn.MSELoss(reduction="sum")
+    else:
+        criterion = type(criterion)(**({"delta": criterion.delta} if hasattr(criterion, "delta") else {}),
+                                    reduction="sum")
+    total, total_cp, count = 0.0, 0.0, 0
+    for batch in batches:
+        board, side_to_move, castling_rights, en_passant, target = (t.to(device) for t in batch)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+            prediction = model(board, side_to_move, castling_rights, en_passant)
+        prediction, target = prediction.float(), target.float()
+        total += criterion(prediction, target).item()
+        total_cp += ((target_to_cp(prediction, transform) - target_to_cp(target, transform)) ** 2).sum().item()
+        count += target.shape[0]
+    return total / max(count, 1), (total_cp / max(count, 1)) ** 0.5
+
+
+def train(model, dataloader, epochs, device, log_every=1, max_updates=None,
+          val_batches=None, amp=False, on_epoch_end=None, transform="tanh",
+          lr=0.001, lr_schedule=None, loss="huber", huber_delta=0.2):
+    """Train for `epochs` passes over `dataloader`, or until `max_updates`
+    optimizer steps have been taken if that comes first.
+
+    If `val_batches` is given, the validation loss is computed after every
+    epoch. `on_epoch_end(epoch, train_loss, val_loss)` is called after each
+    epoch (val_loss is None without validation data).
+
+    `lr_schedule(update_index)` (see make_lr_schedule) scales `lr` before
+    every update; None means a constant learning rate.
+
+    Returns a dict with per-epoch lists "loss", "rmse_cp", "val_loss",
+    "val_rmse_cp" and the total "updates". Losses are in target units; the
+    rmse entries are true centipawn errors after inverting the transform.
+    """
+    criterion, optimizer = build_training_components(model, lr=lr, loss=loss, huber_delta=huber_delta)
     model.to(device)
 
-    epoch_losses = []
+    history = {"loss": [], "rmse_cp": [], "val_loss": [], "val_rmse_cp": [], "updates": 0}
+    updates = 0
     for epoch in range(1, epochs + 1):
-        total, count = 0.0, 0
+        total, total_cp, rows, count = 0.0, 0.0, 0, 0
+        epoch_started = time.time()
         for batch in dataloader:
-            total += train_step(model, criterion, optimizer, batch, device)
+            if lr_schedule is not None:
+                current_lr = lr * lr_schedule(updates)
+                for group in optimizer.param_groups:
+                    group["lr"] = current_lr
+            loss, sq_cp, n = train_step(model, criterion, optimizer, batch, device, amp=amp, transform=transform)
+            total += loss
+            total_cp += sq_cp
+            rows += n
             count += 1
+            updates += 1
+            if max_updates is not None and updates >= max_updates:
+                break
         mean_loss = total / max(count, 1)
-        epoch_losses.append(mean_loss)
-        if log_every and epoch % log_every == 0:
-            print(f"epoch {epoch:>3}/{epochs}  loss {mean_loss:.4f}")
-    return epoch_losses
+        rmse = (total_cp / max(rows, 1)) ** 0.5
+        history["loss"].append(mean_loss)
+        history["rmse_cp"].append(rmse)
+        history["updates"] = updates
+
+        val_loss = None
+        if val_batches is not None:
+            val_loss, val_rmse = evaluate(model, val_batches, amp=amp, transform=transform, criterion=criterion)
+            history["val_loss"].append(val_loss)
+            history["val_rmse_cp"].append(val_rmse)
+
+        if log_every and (epoch % log_every == 0 or epoch == epochs):
+            val_text = f"  val {val_loss:.4f} (rmse {val_rmse:5.0f} cp)" if val_loss is not None else ""
+            lr_text = f"  lr {optimizer.param_groups[0]['lr']:.2e}"
+            print(f"epoch {epoch:>3}/{epochs}  updates {updates:>6}  "
+                  f"loss {mean_loss:.4f} (rmse {rmse:5.0f} cp){val_text}{lr_text}  "
+                  f"{time.time() - epoch_started:6.1f}s", flush=True)
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, mean_loss, val_loss)
+        if max_updates is not None and updates >= max_updates:
+            break
+    return history
+
+
+def save_model(model, path, metadata=None):
+    """Save the model weights plus training metadata as a checkpoint dict.
+
+    Only the state_dict is stored (not the pickled class), so the checkpoint
+    stays loadable after model.py changes as long as the layer names match.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "model_class": type(model).__name__,
+        "model_config": model.config() if hasattr(model, "config") else {},
+        "metadata": metadata or {},
+    }
+    torch.save(checkpoint, path)
+    return path
 
 
 if __name__ == "__main__":
-    # Smoke test: fit random positions with random targets. The loss should
-    # fall as the network memorizes the dummy batch, which proves the loss,
-    # optimizer and backward pass are wired correctly.
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--data", default="data/training_data.csv", help="fen,evaluation CSV to train on")
+    parser.add_argument("--limit", type=int, help="only use the first N rows of --data")
+    parser.add_argument("--epochs", type=int, default=20, help="full passes over the data")
+    parser.add_argument("--updates", type=int, default=None,
+                        help="stop after this many optimizer updates (overrides --epochs as the stopping point)")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--out", default="models/chess_eval.pt", help="where to save the trained model")
+    parser.add_argument("--model", default="large", choices=["small", "large"],
+                        help="small = original 2-conv ChessEvaluationModel; large = residual ChessEvaluationResNet")
+    parser.add_argument("--blocks", type=int, default=6, help="residual blocks (large model only)")
+    parser.add_argument("--channels", type=int, default=128, help="conv channels (large model only)")
+    parser.add_argument("--data-device", default="auto", choices=["auto", "cuda", "cpu"],
+                        help="where the dataset tensors live; auto keeps them on the GPU when they fit")
+    parser.add_argument("--no-cache", action="store_true", help="re-encode the CSV even if a cache exists")
+    parser.add_argument("--val-fraction", type=float, default=0.02,
+                        help="fraction of rows held out for validation (0 disables)")
+    parser.add_argument("--no-amp", action="store_true",
+                        help="disable bfloat16 mixed precision (on by default when training on CUDA)")
+    parser.add_argument("--target", default="tanh", choices=TARGET_TRANSFORMS,
+                        help="how centipawns are mapped to the training target (see cp_to_target)")
+    parser.add_argument("--loss", default="huber", choices=["huber", "mse"], help="training loss")
+    parser.add_argument("--huber-delta", type=float, default=0.2,
+                        help="Huber threshold in target units (errors beyond it count linearly)")
+    parser.add_argument("--lr", type=float, default=0.001, help="peak learning rate")
+    parser.add_argument("--schedule", default="cosine", choices=["cosine", "constant"],
+                        help="learning-rate schedule over the whole run")
+    parser.add_argument("--warmup", type=int, default=1000,
+                        help="updates of linear warmup before the cosine decay starts")
+    args = parser.parse_args()
+    amp = device_is_cuda = torch.cuda.is_available() and not args.no_amp
+
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
-    n = 64
-    dataset = TensorDataset(
-        torch.randint(0, 13, (n, 8, 8)),       # board
-        torch.randint(0, 2, (n, 1)),           # side_to_move
-        torch.randint(0, 2, (n, 4)),           # castling_rights
-        torch.randint(0, 17, (n,)),            # en_passant
-        torch.randn(n, 1),                     # target evaluation
-    )
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+    # Sanity-check the encoder on the start position.
+    start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    board, side, castling, ep = encode_fen(start)
+    assert board.shape == (8, 8) and board[0, 0] == 10 and board[7, 4] == 6 and board[3, 3] == 0
+    assert side.tolist() == [1] and castling.tolist() == [1, 1, 1, 1] and ep.item() == 0
 
-    model = ChessEvaluationModel()
-    losses = train(model, dataloader, epochs=20, device=device, log_every=5)
+    dataset = load_dataset(args.data, limit=args.limit, use_cache=not args.no_cache, transform=args.target)
+    data_bytes = sum(t.numel() * t.element_size() for t in dataset.tensors)
+    if args.data_device == "auto":
+        if device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info()
+            data_device = device if data_bytes < 0.5 * free_bytes else torch.device("cpu")
+        else:
+            data_device = device
+    else:
+        data_device = torch.device(args.data_device)
+    # Hold out the last val_fraction of rows (the CSV is already a random
+    # sample, so the tail is a random subset).
+    n_val = int(len(dataset) * args.val_fraction) if args.val_fraction > 0 else 0
+    n_train = len(dataset) - n_val
+    train_set = TensorDataset(*[t[:n_train] for t in dataset.tensors])
+    val_set = TensorDataset(*[t[n_train:] for t in dataset.tensors]) if n_val else None
 
-    assert losses[-1] < losses[0], f"loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
-    print(f"OK: loss decreased from {losses[0]:.4f} to {losses[-1]:.4f}")
+    dataloader = Batches(train_set, batch_size=args.batch_size, device=data_device)
+    val_batches = Batches(val_set, batch_size=4096, device=data_device, shuffle=False) if val_set else None
+    print(f"dataset tensors: {data_bytes / 1e6:.0f} MB on {data_device}; "
+          f"{n_train:,} train / {n_val:,} validation rows; mixed precision {'on' if amp else 'off'}")
+
+    updates_per_epoch = len(dataloader)
+    if args.updates is not None:
+        epochs = -(-args.updates // updates_per_epoch)          # ceil: enough epochs to reach the target
+        planned_updates = args.updates
+    else:
+        epochs = args.epochs
+        planned_updates = epochs * updates_per_epoch
+    print(f"loaded {len(dataset):,} positions from {args.data}")
+    print(f"batch size {args.batch_size} -> {updates_per_epoch} updates per epoch; "
+          f"training for {planned_updates} updates ({epochs} epoch{'s' if epochs != 1 else ''})")
+    print(f"target transform: {args.target}; loss {args.loss}"
+          + (f" (delta {args.huber_delta})" if args.loss == "huber" else "")
+          + f"; lr {args.lr} with {args.schedule} schedule"
+          + (f" ({args.warmup} warmup updates)" if args.schedule == "cosine" else ""))
+    lr_schedule = make_lr_schedule(args.schedule, planned_updates, warmup=args.warmup)
+
+    if args.model == "small":
+        model = ChessEvaluationModel()
+    else:
+        model = ChessEvaluationResNet(blocks=args.blocks, channels=args.channels)
+    print(f"model: {type(model).__name__} with {sum(p.numel() for p in model.parameters()):,} parameters")
+    started = time.time()
+    best_path = os.path.splitext(args.out)[0] + "_best.pt"
+    best = {"val": None, "epoch": None}
+
+    target_meta = {"target_transform": args.target, "eval_scale": EVAL_SCALE, "tanh_scale": TANH_SCALE}
+
+    def on_epoch_end(epoch, train_loss, val_loss):
+        # Keep the checkpoint with the lowest validation loss as <out>_best.pt.
+        if val_loss is not None and (best["val"] is None or val_loss < best["val"]):
+            best["val"], best["epoch"] = val_loss, epoch
+            save_model(model, best_path, metadata={"epoch": epoch, "train_loss": train_loss,
+                                                   "val_loss": val_loss, "model": type(model).__name__,
+                                                   **target_meta})
+
+    hist = train(
+        model, dataloader, epochs=epochs, device=device, log_every=max(1, epochs // 30),
+        max_updates=args.updates, val_batches=val_batches, amp=amp, on_epoch_end=on_epoch_end,
+        transform=args.target, lr=args.lr, lr_schedule=lr_schedule,
+        loss=args.loss, huber_delta=args.huber_delta)
+    train_seconds = time.time() - started
+    losses, val_losses = hist["loss"], hist["val_loss"]
+    updates_done = hist["updates"]
+    print(f"finished: {updates_done} updates in {train_seconds:.1f}s, "
+          f"loss {losses[0]:.4f} -> {losses[-1]:.4f}  "
+          f"(rmse {hist['rmse_cp'][0]:.0f} -> {hist['rmse_cp'][-1]:.0f} cp)")
+    if val_losses:
+        best_idx = val_losses.index(best["val"])
+        print(f"validation: rmse {hist['val_rmse_cp'][0]:.0f} -> {hist['val_rmse_cp'][-1]:.0f} cp; "
+              f"best {hist['val_rmse_cp'][best_idx]:.0f} cp at epoch {best['epoch']} (saved to {best_path})")
+
+    save_model(model, args.out, metadata={
+        "data": args.data,
+        "rows": len(dataset),
+        "epochs": len(losses),
+        "updates": updates_done,
+        "batch_size": args.batch_size,
+        "model": type(model).__name__,
+        **target_meta,
+        "loss": args.loss,
+        "huber_delta": args.huber_delta if args.loss == "huber" else None,
+        "lr": args.lr,
+        "schedule": args.schedule,
+        "warmup": args.warmup,
+        "final_loss": losses[-1],
+        "epoch_losses": losses,
+        "epoch_rmse_cp": hist["rmse_cp"],
+        "val_losses": val_losses,
+        "val_rmse_cp": hist["val_rmse_cp"],
+        "val_rows": n_val,
+        "amp": amp,
+        "train_seconds": round(train_seconds, 1),
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    print(f"saved model to {args.out}")
