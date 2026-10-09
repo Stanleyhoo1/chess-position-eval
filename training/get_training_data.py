@@ -14,14 +14,14 @@ Each output row is one position:
                    forced mates become +CP_CAP (White mates) or -CP_CAP (Black mates)
 
 Only the FEN is stored. Decoding it into model inputs (8x8 piece-ID board,
-side to move, castling flags, en-passant ID) happens at training time in
-train.py, so the encoding can change without regenerating this file.
+side to move, castling flags, en-passant ID) happens at training time via
+chess_eval/encoding.py, so the encoding can change without regenerating this file.
 
-Usage:
-    python get_training_data.py                       # 500k rows -> data/training_data.csv
-    python get_training_data.py --rows 50000 --min-depth 25 --out data/small.csv
-    python get_training_data.py --resume              # continue an interrupted run
-    python get_training_data.py --rows 100000 --skip-per-group 40000 --seed 7 --out data/test_data.csv
+Usage (from the repository root):
+    python -m training.get_training_data                       # 500k rows -> data/training_data.csv
+    python -m training.get_training_data --rows 50000 --min-depth 25 --out data/small.csv
+    python -m training.get_training_data --resume              # continue an interrupted run
+    python -m training.get_training_data --rows 100000 --skip-per-group 40000 --seed 7 --out data/test_data.csv
 """
 
 import argparse

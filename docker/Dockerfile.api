@@ -5,10 +5,11 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # CPU-only PyTorch keeps the image far smaller than the default CUDA build.
-# train.py (imported for the FEN encoder) pulls in numpy and pandas at module level.
-RUN pip install --no-cache-dir torch numpy pandas chess --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+# chess_eval needs only torch, numpy (FEN encoder) and python-chess (search).
+RUN pip install --no-cache-dir torch numpy chess --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
 
-COPY model.py train.py load_model.py search.py server.py ./
+COPY chess_eval/ ./chess_eval/
+COPY server.py ./
 # The checkpoint is bind-mounted from ./models in docker-compose.yml, so a
 # retrained model only needs a container restart, not a rebuild.
 

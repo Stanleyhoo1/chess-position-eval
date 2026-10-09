@@ -32,7 +32,7 @@ Without Docker, the Python server serves both the page and the model:
 python server.py            # http://localhost:8000
 ```
 
-Both need a trained checkpoint at `models/chess_eval.pt` (produced by `train.py`).
+Both need a trained checkpoint at `models/chess_eval.pt` (produced by `python -m training.train`).
 
 ## Playing on Lichess
 
@@ -79,15 +79,33 @@ thinking time to the clock. Games can be watched live on the bot's Lichess profi
 - The text box always shows the FEN for the current position, without the half-move
   and full-move counters: `<board> <side> <castling> -`.
 
+## Training
+
+Everything under `training/` is run as a module from the repository root:
+
+```sh
+python -m training.get_training_data        # sample positions from the Lichess eval dataset -> data/training_data.csv
+python -m training.train                    # train on it; writes models/chess_eval.pt (+ _best.pt)
+python -m training.evaluate_model           # score a checkpoint on a held-out data/test_data.csv
+```
+
+The engine's own command-line checks work the same way: `python -m chess_eval.load_model "<fen>"`
+scores positions with the network alone, `python -m chess_eval.search --best "<fen>"` runs the
+full search.
+
 ## Layout
 
-- `web/` — static site (`index.html`, `style.css`, `app.js`, `fen.js`, `pieces/`, `screenshot.png`)
-- `web/fen.js` — pure FEN parse/serialize logic, loadable under node for testing
-- `docker/` — `Dockerfile` (nginx container serving `web/` and proxying `/api/`), `Dockerfile.api` (model service), `nginx.conf`
-- `docker-compose.yml` — wires the two containers together; build context is the repo root
-- `server.py` — model inference service (`load_model.py` + `model.py` + `search.py`)
+- `chess_eval/` — the engine as a package: `model.py` (network), `encoding.py` (FEN -> tensors,
+  centipawn <-> target mapping), `load_model.py` (checkpoint loading + batch evaluation), `search.py`
+  (quiescence + alpha-beta search)
+- `training/` — `get_training_data.py`, `train.py`, `evaluate_model.py`
+- `server.py` — model inference service and dev web server (`python server.py`)
 - `lichess_bot.py` — plays on Lichess as a BOT account using the same search
-- `get_training_data.py`, `train.py`, `evaluate_model.py` — build the `fen,evaluation` dataset, train the model, and score it on a held-out set
+- `web/` — static site (`index.html`, `style.css`, `app.js`, `fen.js`, `pieces/`, `screenshot.png`);
+  `fen.js` is pure FEN parse/serialize logic, loadable under node for testing
+- `docker/` — `Dockerfile` (nginx container serving `web/` and proxying `/api/`), `Dockerfile.api`
+  (model service, copies only `chess_eval/` and `server.py`), `nginx.conf`
+- `docker-compose.yml` — wires the two containers together; build context is the repo root
 - `models/` — trained checkpoints; `data/` — datasets and logs (git-ignored)
 - `docs/` — demo video and GIF
 

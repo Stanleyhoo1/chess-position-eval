@@ -34,18 +34,18 @@ Two endgame aids keep the bot from drawing won games:
 
 As a library:
 
-    from load_model import load_model
-    from search import Searcher
+    from chess_eval.load_model import load_model
+    from chess_eval.search import Searcher
     model, _ = load_model("models/chess_eval_10m_tanh_best.pt")
     s = Searcher(model)
     s.evaluate(fen).score                      # quiescence only
     r = s.best_move(fen, depth=4, max_seconds=3)
     r.move, r.san, r.score, r.mate_in, r.line, r.depth
 
-From the command line:
+From the command line (run from the repository root):
 
-    python search.py "<fen>" ...                # quiescence evaluation
-    python search.py --best "<fen>" ...         # best move (full search)
+    python -m chess_eval.search "<fen>" ...          # quiescence evaluation
+    python -m chess_eval.search --best "<fen>" ...   # best move (full search)
 """
 
 import argparse
@@ -55,7 +55,7 @@ from dataclasses import dataclass
 
 import chess
 
-from load_model import evaluate_fens, load_model
+from chess_eval.load_model import evaluate_fens, load_model
 
 MATE_SCORE = 2500.0          # reported score for a forced mate (training cap)
 MATE_VALUE = 100000          # internal mate score; minus ply so faster mates win

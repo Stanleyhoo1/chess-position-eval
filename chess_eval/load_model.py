@@ -2,20 +2,20 @@
 
 As a library:
 
-    from load_model import load_model, evaluate_fen
+    from chess_eval.load_model import load_model, evaluate_fen
     model, metadata = load_model("models/chess_eval.pt")
     score = evaluate_fen(model, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -")
 
 Scores are centipawns from White's point of view, clipped to +-2500 (forced
 mates were stored as +-2500). The network itself outputs a squashed target
-(see train.cp_to_target); this module inverts whichever transform the
+(see chess_eval.encoding.cp_to_target); this module inverts whichever transform the
 checkpoint records ("linear" for older checkpoints, "tanh" for newer ones).
 
-From the command line:
+From the command line (run from the repository root):
 
-    python load_model.py                                    # evaluates a few sample positions
-    python load_model.py "8/8/2B2k2/p4p2/5P1p/Pb6/1P3KP1/8 w - -"
-    python load_model.py --model models/run1.pt "<fen>" "<fen>"
+    python -m chess_eval.load_model                         # evaluates a few sample positions
+    python -m chess_eval.load_model "8/8/2B2k2/p4p2/5P1p/Pb6/1P3KP1/8 w - -"
+    python -m chess_eval.load_model --model models/run1.pt "<fen>" "<fen>"
 """
 
 import argparse
@@ -23,8 +23,8 @@ import sys
 
 import torch
 
-from model import MODEL_CLASSES, ChessEvaluationModel
-from train import encode_fen, target_to_cp
+from chess_eval.encoding import encode_fen, target_to_cp
+from chess_eval.model import MODEL_CLASSES, ChessEvaluationModel
 
 
 def load_model(path="models/chess_eval.pt", device=None):

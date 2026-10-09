@@ -1,5 +1,5 @@
 """Play on Lichess as a BOT account, choosing moves with the trained
-evaluator and the alpha-beta search from search.py.
+evaluator and the alpha-beta search from chess_eval/search.py.
 
 One-time setup
 --------------
@@ -40,8 +40,8 @@ from collections import Counter
 import chess
 import requests
 
-from load_model import load_model
-from search import Searcher
+from chess_eval.load_model import load_model
+from chess_eval.search import Searcher
 
 LICHESS = "https://lichess.org"
 DEFAULT_MODEL = "models/chess_eval_10m_tanh_best.pt"

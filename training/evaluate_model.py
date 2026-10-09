@@ -16,9 +16,9 @@ transform back to centipawns, and the metrics are:
                  Also reported: sign accuracy on decisive positions only
                  (|engine| > DEAD_ZONE), ignoring the prediction's dead zone.
 
-Usage:
-    python evaluate_model.py                                   # default model on data/test_data.csv
-    python evaluate_model.py --model models/chess_eval_10m_best.pt --data data/test_data.csv
+Usage (from the repository root):
+    python -m training.evaluate_model                          # default model on data/test_data.csv
+    python -m training.evaluate_model --model models/chess_eval_10m_best.pt --data data/test_data.csv
 """
 
 import argparse
@@ -28,8 +28,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from load_model import load_model
-from train import encode_fens, target_to_cp
+from chess_eval.encoding import encode_fens, target_to_cp
+from chess_eval.load_model import load_model
 
 DEAD_ZONE = 50.0     # centipawns; |eval| <= this counts as "equal"
 

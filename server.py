@@ -19,7 +19,7 @@ Endpoints:
                          sides) with the capture search at the leaves; the bot uses it.
     GET  /api/health     -> {"ok": true, "model": "<path>", "device": "cpu", ...}
 
-Each evaluation runs the quiescence (capture) search from search.py with the
+Each evaluation runs the quiescence (capture) search from chess_eval/search.py with the
 network scoring the quiet leaf positions, so hanging pieces and mates are
 resolved rather than guessed. Scores are from White's point of view and
 clipped to +-EVAL_SCALE centipawns (the range the model was trained on).
@@ -44,9 +44,9 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import chess
 import torch
 
-from load_model import load_model
-from search import Searcher
-from train import EVAL_SCALE
+from chess_eval.encoding import EVAL_SCALE
+from chess_eval.load_model import load_model
+from chess_eval.search import Searcher
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 MAX_BATCH = 256

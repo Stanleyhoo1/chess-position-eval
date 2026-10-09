@@ -135,7 +135,7 @@ class ChessEvaluationResNet(nn.Module):
         memorization-prone fully connected layer stays small.
 
     Inputs and output have exactly the same shapes and meanings as
-    ChessEvaluationModel, so train.py and load_model.py work unchanged.
+    ChessEvaluationModel, so training/train.py and chess_eval/load_model.py work unchanged.
     """
 
     NUM_PIECE_IDS = 13
