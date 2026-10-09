@@ -1,6 +1,8 @@
 services:
   web:
-    build: .
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     container_name: chess-position-setup
     ports:
       - "8080:80"
@@ -14,7 +16,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: docker/Dockerfile.api
     container_name: chess-position-eval-api
     volumes:
       - ./models:/app/models:ro

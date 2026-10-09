@@ -16,6 +16,8 @@ Playing
     python lichess_bot.py play --ai 3                     # one game vs Lichess Stockfish level 3
     python lichess_bot.py play --ai 5 --color black --clock 5+3 --games 3
     python lichess_bot.py play --user maia1               # challenge another bot or user (casual)
+    python lichess_bot.py match --ai 5 --games 100 --parallel 3   # a logged match vs Stockfish, 3 games at a time
+    python lichess_bot.py report                          # summarize the match log so far
     python lichess_bot.py resume                          # play all games already in progress, then exit
     python lichess_bot.py listen                          # accept incoming standard challenges
 
@@ -28,10 +30,12 @@ games live at https://lichess.org/@/<bot name>/all.
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
 import time
+from collections import Counter
 
 import chess
 import requests
@@ -41,6 +45,7 @@ from search import Searcher
 
 LICHESS = "https://lichess.org"
 DEFAULT_MODEL = "models/chess_eval_10m_tanh_best.pt"
+DEFAULT_LOG = "data/lichess_match.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +114,7 @@ class LichessAPI:
 
 def _clock_fields(clock):
     """'5+3' -> {'clock.limit': 300, 'clock.increment': 3}; None -> correspondence (days=1)."""
-    if not clock:
+    if not clock or clock.lower() in ("none", "corr", "correspondence"):
         return {"days": 1}
     minutes, _, inc = clock.partition("+")
     return {"clock.limit": int(float(minutes) * 60), "clock.increment": int(inc or 0)}
@@ -129,15 +134,18 @@ class Engine:
         self.seconds = seconds
         self.lock = threading.Lock()    # Searcher is not thread-safe
         print(f"engine: {model_path} ({type(model).__name__}) depth {depth}, "
-              f"{seconds:.1f}s/move max", flush=True)
+              f"{'no time limit' if seconds <= 0 else f'{seconds:.1f}s/move max'}", flush=True)
 
     def budget(self, time_left_ms, inc_ms):
-        """Seconds to spend on this move given the clock."""
-        if time_left_ms is None:
-            return self.seconds
+        """Seconds to spend on this move given the clock; None = no limit
+        (--seconds 0, only when there is no clock or more than an hour left)."""
+        unlimited = self.seconds <= 0
+        if time_left_ms is None or (unlimited and time_left_ms > 3_600_000):
+            return None if unlimited else self.seconds
         left = time_left_ms / 1000
         inc = (inc_ms or 0) / 1000
-        return max(0.1, min(self.seconds, left / 40 + inc * 0.8, left * 0.5))
+        cap = 60.0 if unlimited else self.seconds
+        return max(0.1, min(cap, left / 40 + inc * 0.8, left * 0.5))
 
     def choose(self, board, time_left_ms=None, inc_ms=None):
         with self.lock:
@@ -157,7 +165,18 @@ def board_from(initial_fen, moves):
 
 
 def play_game(api, engine, game_id, my_id, greet=True, chat_eval=False):
-    """Follow one game's stream and reply with a move whenever it is our turn."""
+    """Follow one game's stream and reply with a move whenever it is our turn.
+    If the stream drops before the game is over, reconnect and carry on."""
+    for attempt in range(20):
+        result = _follow_game(api, engine, game_id, my_id, greet and attempt == 0, chat_eval)
+        if result.get("status") != "stream-ended":
+            return result
+        print(f"[{game_id}] stream ended before the game did; reconnecting", flush=True)
+        time.sleep(5)
+    return {"id": game_id, "status": "stream-ended", "result": "unknown"}
+
+
+def _follow_game(api, engine, game_id, my_id, greet, chat_eval):
     color = None
     initial_fen = "startpos"
     print(f"[{game_id}] joined", flush=True)
@@ -183,7 +202,10 @@ def play_game(api, engine, game_id, my_id, greet=True, chat_eval=False):
             winner = state.get("winner")
             outcome = "draw" if not winner else f"{winner} wins"
             print(f"[{game_id}] over: {status} ({outcome})", flush=True)
-            return status
+            mine = "white" if color == chess.WHITE else "black"
+            result = "draw" if not winner else ("win" if winner == mine else "loss")
+            return {"id": game_id, "color": mine, "status": status, "winner": winner, "result": result,
+                    "plies": len(state.get("moves", "").split()), "finished": time.strftime("%Y-%m-%d %H:%M:%S")}
 
         board = board_from(initial_fen, state.get("moves", ""))
         if board.turn != color or board.is_game_over():
@@ -209,7 +231,7 @@ def play_game(api, engine, game_id, my_id, greet=True, chat_eval=False):
             else:
                 text = f"{result.san}: eval {result.score / 100:+.2f} (depth {result.depth})"
             api.chat(game_id, text)
-    return "stream-ended"
+    return {"id": game_id, "status": "stream-ended", "result": "unknown"}
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +324,127 @@ def resume_games(api, engine, my_id, chat_eval=False):
 
 
 # ---------------------------------------------------------------------------
+# Match vs the Lichess AI
+# ---------------------------------------------------------------------------
+
+def run_match(api, engine, my_id, level, games, parallel, clock, color, log_path, chat_eval=False):
+    """Play `games` games against Stockfish `level`, keeping `parallel` games in
+    flight. Colours alternate unless `color` is white/black. Every finished
+    game is appended to `log_path` (one JSON object per line)."""
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    lock = threading.Lock()
+    finished = threading.Event()
+    active = {}
+    results = []
+    started = 0
+    log = open(log_path, "a")
+
+    def runner(game_id):
+        try:
+            res = play_game(api, engine, game_id, my_id, greet=False, chat_eval=chat_eval)
+        except Exception as e:              # network hiccup etc.: record and move on
+            res = {"id": game_id, "status": "error", "result": "unknown", "error": str(e)[:200]}
+        res.update({"level": level, "depth": engine.depth})
+        with lock:
+            results.append(res)
+            active.pop(game_id, None)
+            log.write(json.dumps(res) + "\n")
+            log.flush()
+        finished.set()
+
+    print(f"match: {games} games vs Stockfish level {level}, {parallel} at a time, log -> {log_path}", flush=True)
+    backoff = 60
+    try:
+        # Adopt games against this AI level that are already running (e.g. from
+        # an interrupted match) so they are finished and counted, not orphaned.
+        for g in api.now_playing():
+            if g.get("opponent", {}).get("ai") == level and started < games:
+                started += 1
+                print(f"game {started}/{games} adopted as {g.get('color')}  https://lichess.org/{g['gameId']}", flush=True)
+                t = threading.Thread(target=runner, args=(g["gameId"],), daemon=True)
+                with lock:
+                    active[g["gameId"]] = t
+                t.start()
+        while started < games or active:
+            while started < games and len(active) < parallel:
+                want = color if color in ("white", "black") else ("white" if started % 2 == 0 else "black")
+                try:
+                    game = api.challenge_ai(level, clock, want)
+                except RuntimeError as e:
+                    # Lichess rate-limits AI challenge creation; back off exponentially.
+                    print(f"challenge failed ({e}); retrying in {backoff}s", flush=True)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 600)
+                    continue
+                backoff = 60
+                game_id = game.get("id")
+                started += 1
+                print(f"game {started}/{games} started as {want}  https://lichess.org/{game_id}", flush=True)
+                t = threading.Thread(target=runner, args=(game_id,), daemon=True)
+                with lock:
+                    active[game_id] = t
+                t.start()
+                time.sleep(2)                   # be gentle with challenge creation
+            finished.wait(timeout=60)
+            finished.clear()
+            with lock:
+                done = len(results)
+            if done and done % 5 == 0:
+                print("progress: " + summary_line(results), flush=True)
+    except KeyboardInterrupt:
+        print("interrupted; results so far:", flush=True)
+    finally:
+        log.close()
+    print_summary(results, level)
+    return results
+
+
+def summary_line(results):
+    c = Counter(r.get("result") for r in results)
+    n = c["win"] + c["draw"] + c["loss"]
+    score = (c["win"] + 0.5 * c["draw"]) / n if n else 0
+    return f"{n} games  +{c['win']} ={c['draw']} -{c['loss']}  score {100 * score:.1f}%"
+
+
+def print_summary(results, level=None):
+    played = [r for r in results if r.get("result") in ("win", "draw", "loss")]
+    if not played:
+        print("no completed games")
+        return
+    c = Counter(r["result"] for r in played)
+    n = len(played)
+    score = (c["win"] + 0.5 * c["draw"]) / n
+    print()
+    print(f"=== {n} games vs Stockfish level {level or '?'}: +{c['win']} ={c['draw']} -{c['loss']}  "
+          f"score {100 * score:.1f}% ===")
+    for col in ("white", "black"):
+        sub = Counter(r["result"] for r in played if r.get("color") == col)
+        m = sum(sub.values())
+        if m:
+            print(f"  as {col}: {m} games  +{sub['win']} ={sub['draw']} -{sub['loss']}  "
+                  f"score {100 * (sub['win'] + 0.5 * sub['draw']) / m:.1f}%")
+    if 0 < score < 1:
+        diff = 400 * math.log10(score / (1 - score))
+        print(f"  performance: {diff:+.0f} Elo relative to the opponent")
+    else:
+        print(f"  performance: {'+' if score == 1 else '-'}inf Elo (every game {'won' if score == 1 else 'lost'})")
+    ends = Counter(r.get("status") for r in played)
+    print("  endings: " + ", ".join(f"{k} {v}" for k, v in ends.most_common()))
+    avg = sum(r.get("plies", 0) for r in played) / n
+    print(f"  average length: {avg / 2:.0f} moves")
+    skipped = len(results) - n
+    if skipped:
+        print(f"  ({skipped} game(s) with unknown result not counted)")
+
+
+def load_log(log_path):
+    if not os.path.exists(log_path):
+        return []
+    with open(log_path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -310,7 +453,8 @@ def main():
     parser.add_argument("--token", default=os.environ.get("LICHESS_TOKEN"), help="API token (default: $LICHESS_TOKEN)")
     parser.add_argument("--model", default=os.environ.get("MODEL_PATH", DEFAULT_MODEL), help="checkpoint path")
     parser.add_argument("--depth", type=int, default=4, help="full-width search depth in plies")
-    parser.add_argument("--seconds", type=float, default=3.0, help="max seconds per move (less when short on time)")
+    parser.add_argument("--seconds", type=float, default=3.0,
+                        help="max seconds per move, less when short on time; 0 = no limit (search to --depth)")
     parser.add_argument("--qdepth", type=int, default=6, help="quiescence depth")
     parser.add_argument("--max-nodes", type=int, default=4000, help="quiescence node budget")
     parser.add_argument("--chat-eval", action="store_true",
@@ -327,9 +471,26 @@ def main():
     p.add_argument("--clock", default="10+5", help="minutes+increment, e.g. 5+3 (default 10+5)")
     p.add_argument("--games", type=int, default=1, help="how many games to play in a row")
 
+    m = sub.add_parser("match", help="play a logged series of games vs the Lichess AI, several at a time")
+    m.add_argument("--ai", type=int, choices=range(1, 9), metavar="LEVEL", required=True, help="Stockfish level 1-8")
+    m.add_argument("--games", type=int, default=100)
+    m.add_argument("--parallel", type=int, default=3, help="games in flight at once")
+    m.add_argument("--color", default="alternate", choices=["alternate", "white", "black"])
+    m.add_argument("--clock", default="none", help="minutes+increment, or 'none' for correspondence (default)")
+    m.add_argument("--log", default=DEFAULT_LOG, help="results log (JSON lines, appended)")
+
+    r = sub.add_parser("report", help="summarize the match log (no token needed)")
+    r.add_argument("--log", default=DEFAULT_LOG)
+
     sub.add_parser("resume", help="play all games currently in progress, then exit")
     sub.add_parser("listen", help="accept incoming challenges and play them until stopped")
     args = parser.parse_args()
+
+    if args.cmd == "report":
+        results = load_log(args.log)
+        print(f"{args.log}: {len(results)} record(s)")
+        print_summary(results, results[-1].get("level") if results else None)
+        return 0
 
     if not args.token:
         sys.exit("no token: pass --token or set LICHESS_TOKEN (see the docstring for setup)")
@@ -353,6 +514,11 @@ def main():
         sys.exit("this account is not a BOT account yet; run: python lichess_bot.py upgrade")
 
     engine = Engine(args.model, args.depth, args.seconds, args.qdepth, args.max_nodes)
+
+    if args.cmd == "match":
+        run_match(api, engine, my_id, args.ai, args.games, args.parallel, args.clock, args.color,
+                  args.log, chat_eval=args.chat_eval)
+        return 0
 
     if args.cmd == "resume":
         try:

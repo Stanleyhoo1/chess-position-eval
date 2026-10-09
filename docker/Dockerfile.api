@@ -1,0 +1,16 @@
+# Model inference service: python server.py --no-static, proxied by nginx at /api/.
+# Build context is the repo root (see docker-compose.yml), so COPY paths are relative to it.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# CPU-only PyTorch keeps the image far smaller than the default CUDA build.
+# train.py (imported for the FEN encoder) pulls in numpy and pandas at module level.
+RUN pip install --no-cache-dir torch numpy pandas chess --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+
+COPY model.py train.py load_model.py search.py server.py ./
+# The checkpoint is bind-mounted from ./models in docker-compose.yml, so a
+# retrained model only needs a container restart, not a rebuild.
+
+EXPOSE 8000
+CMD ["python", "server.py", "--no-static", "--cpu", "--host", "0.0.0.0", "--port", "8000"]

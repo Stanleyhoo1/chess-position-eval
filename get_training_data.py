@@ -21,6 +21,7 @@ Usage:
     python get_training_data.py                       # 500k rows -> data/training_data.csv
     python get_training_data.py --rows 50000 --min-depth 25 --out data/small.csv
     python get_training_data.py --resume              # continue an interrupted run
+    python get_training_data.py --rows 100000 --skip-per-group 40000 --seed 7 --out data/test_data.csv
 """
 
 import argparse
@@ -130,6 +131,10 @@ def main():
     parser.add_argument("--min-depth", type=int, default=20, help="skip evaluations shallower than this")
     parser.add_argument("--per-group", type=int, default=5_000,
                         help="max positions taken from each ~1M-row row group (spreads the sample)")
+    parser.add_argument("--skip-per-group", type=int, default=0,
+                        help="skip this many depth-eligible rows at the start of every row group before "
+                             "taking any; use it to build a test set disjoint from an earlier export, "
+                             "which always took rows from the start of each group")
     parser.add_argument("--out", default="data/training_data.csv")
     parser.add_argument("--seed", type=int, default=42, help="seed for the row-group visiting order")
     parser.add_argument("--no-shuffle", action="store_true", help="visit row groups in stored order")
@@ -179,7 +184,11 @@ def main():
             mates = table["mate"].to_pylist()
 
             taken = 0
+            skipped_lead = 0
             for fen, cp, mate in zip(fens, cps, mates):
+                if skipped_lead < args.skip_per_group:
+                    skipped_lead += 1         # leave the rows an earlier export may have used
+                    continue
                 if fen in seen_fens:
                     skipped_dup += 1          # same position, another engine line
                     continue
